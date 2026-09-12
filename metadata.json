@@ -1,0 +1,6 @@
+{
+  "name": "TJ GUN 1.0",
+  "description": "Công cụ tự động chia phân cảnh SRT và tạo Prompt tạo ảnh chuẩn với thông tin nhân vật & visual style dành cho API Google Free Tier.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
