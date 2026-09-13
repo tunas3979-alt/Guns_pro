@@ -1,5 +1,5 @@
 import React, { useRef } from 'react';
-import { Play, Pause, Square, RotateCcw, Download, Upload, Clock, SlidersHorizontal, Check, Zap, Clipboard, Sparkles, RefreshCw } from 'lucide-react';
+import { Play, Pause, Square, RotateCcw, Download, Upload, Clock, SlidersHorizontal, Check, Zap, Clipboard, RefreshCw } from 'lucide-react';
 import { ProcessingState, SceneInterval, ConcurrencyMode } from '../types';
 
 interface ControlToolbarProps {
@@ -22,7 +22,6 @@ interface ControlToolbarProps {
   onExportTxt: () => void;
   onSRTFileUpload: (file: File) => void;
   onOpenPasteModal?: () => void;
-  onQuickLoadHunterSRT?: () => void;
   onIntervalChange: (newInterval: SceneInterval) => void;
   loadedFileName?: string;
   isRecentlyCleared?: boolean;
@@ -48,7 +47,6 @@ export const ControlToolbar: React.FC<ControlToolbarProps> = ({
   onExportTxt,
   onSRTFileUpload,
   onOpenPasteModal,
-  onQuickLoadHunterSRT,
   onIntervalChange,
   loadedFileName,
   isRecentlyCleared,
@@ -110,23 +108,6 @@ export const ControlToolbar: React.FC<ControlToolbarProps> = ({
           >
             <Clipboard className="w-3.5 h-3.5 text-slate-500" />
             <span className="hidden sm:inline">Dán SRT</span>
-          </button>
-        )}
-
-        {/* Quick Load Hunter SRT Button */}
-        {onQuickLoadHunterSRT && (!loadedFileName || loadedFileName.includes('Demo') || loadedFileName.includes('Bình minh')) && (
-          <button
-            onClick={onQuickLoadHunterSRT}
-            disabled={isRunning}
-            className={`h-8 inline-flex items-center gap-1.5 px-2.5 rounded-lg text-xs font-medium transition-all border cursor-pointer ${
-              isRunning
-                ? 'opacity-50 cursor-not-allowed'
-                : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200/80 active:scale-[0.98]'
-            }`}
-            title="Nạp ngay kịch bản SRT Thợ Săn (308 vs 6.5 Creedmoor) bạn vừa tải lên"
-          >
-            <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-            <span>Nạp file SRT bạn vừa gửi</span>
           </button>
         )}
 

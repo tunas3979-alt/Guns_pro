@@ -18,12 +18,12 @@ import { StatusBar } from './components/StatusBar';
 import { SceneListView } from './components/SceneListView';
 import { ErrorHistoryLog } from './components/ErrorHistoryLog';
 import { NetworkAlertModal } from './components/NetworkAlertModal';
+import { QuotaRateLimitModal } from './components/QuotaRateLimitModal';
 import { CompletionModal } from './components/CompletionModal';
 import { CacheClearedSuccessModal } from './components/CacheClearedSuccessModal';
 import { PasteSRTModal } from './components/PasteSRTModal';
 import { ToastNotification, ToastMessage } from './components/ToastNotification';
 import { completionAudioAlert } from './utils/audioAlert';
-import { HUNTER_SRT_CONTENT } from './data/hunterSrt';
 
 // Sample SRT Content for instant test preview if user doesn't upload file right away
 const DEMO_SRT_CONTENT = `1
@@ -132,6 +132,20 @@ export default function App() {
     maxRPD: 1500,
     estimatedResetSeconds: 0,
     isRealTelemetry: true,
+  });
+
+  // Quota & Rate Limit Modal state
+  const [quotaModalState, setQuotaModalState] = useState<{
+    isOpen: boolean;
+    modelName: string;
+    countdownSeconds: number;
+    isDailyQuota: boolean;
+    message?: string;
+  }>({
+    isOpen: false,
+    modelName: 'Gemini 3.8 Flash',
+    countdownSeconds: 60,
+    isDailyQuota: false,
   });
 
   // Fetch real authoritative API telemetry from server
@@ -352,7 +366,7 @@ export default function App() {
   };
 
   // Generate Prompt API Call for a single scene
-  const generatePromptForScene = async (scene: SceneItem): Promise<{ success: boolean; prompt?: string; error?: string; errorCode?: string }> => {
+  const generatePromptForScene = async (scene: SceneItem): Promise<{ success: boolean; prompt?: string; error?: string; errorCode?: string; retryAfterSeconds?: number }> => {
     try {
       const response = await fetch('/api/generate-prompt', {
         method: 'POST',
@@ -370,20 +384,6 @@ export default function App() {
       const data = await response.json();
 
       if (response.ok && data.success) {
-        // If server auto-fell back from an exhausted model to an active healthy model
-        if (data.wasFallback && data.modelUsed && data.modelUsed !== selectedModel) {
-          setSelectedModel(data.modelUsed);
-          try {
-            localStorage.setItem('tj_selected_model', data.modelUsed);
-          } catch {}
-          setToast({
-            id: Date.now().toString(),
-            type: 'info',
-            title: 'Tự động chuyển Model tránh lỗi hạn ngạch',
-            description: `Đã tự động chuyển đổi sang ${data.modelUsed} để tiếp tục xử lý mượt mà.`,
-          });
-        }
-
         // Update real API telemetry directly from authoritative backend response
         if (data.quotaStats) {
           setQuotaStats({
@@ -400,10 +400,23 @@ export default function App() {
         }
         return { success: true, prompt: data.prompt };
       } else {
+        // Handle API Rate Limit (429) - Trigger countdown modal without changing model
+        if (data.errorCode === 'API_429_RATE_LIMIT') {
+          const retrySecs = data.retryAfterSeconds || 60;
+          setQuotaModalState({
+            isOpen: true,
+            modelName: selectedModel,
+            countdownSeconds: retrySecs,
+            isDailyQuota: !!data.isDailyQuota,
+            message: data.error,
+          });
+        }
+
         return {
           success: false,
           error: data.error || 'Lỗi không thể sinh prompt',
           errorCode: data.errorCode || 'UNKNOWN',
+          retryAfterSeconds: data.retryAfterSeconds,
         };
       }
     } catch (err: any) {
@@ -580,9 +593,10 @@ export default function App() {
               `Chi tiết phân cảnh #${targetScene.sceneIndex} (Luồng #${workerId}): "${targetScene.srtText.substring(0, 60)}..."`
             );
 
-            // If 429 Rate limit, backoff to let RPM cool down
+            // If 429 Rate limit, backoff using calculated retryAfterSeconds (or 60s default)
             if (errType === 'API_429_RATE_LIMIT') {
-              await new Promise((r) => setTimeout(r, 6000));
+              const backoffMs = Math.max(5000, ((result as any).retryAfterSeconds || 60) * 1000);
+              await new Promise((r) => setTimeout(r, backoffMs));
             }
           }
 
@@ -881,7 +895,6 @@ export default function App() {
           onExportTxt={handleExportTxt}
           onSRTFileUpload={handleSRTFileUpload}
           onOpenPasteModal={() => setShowPasteModal(true)}
-          onQuickLoadHunterSRT={() => handleLoadRawSRT(HUNTER_SRT_CONTENT, 'Hunter_308_vs_65Creedmoor.srt')}
           onIntervalChange={handleIntervalChange}
           loadedFileName={loadedFileName}
           isRecentlyCleared={isRecentlyCleared}
@@ -991,6 +1004,25 @@ export default function App() {
         isOnline={isOnline}
         offlineDurationSeconds={offlineDuration}
         onManualReconnect={checkHealth}
+      />
+
+      {/* 8.5. Quota & Rate Limit (429) Countdown Modal */}
+      <QuotaRateLimitModal
+        isOpen={quotaModalState.isOpen}
+        modelName={quotaModalState.modelName}
+        countdownSeconds={quotaModalState.countdownSeconds}
+        isDailyQuota={quotaModalState.isDailyQuota}
+        message={quotaModalState.message}
+        onRetryNow={() => {
+          setQuotaModalState((prev) => ({ ...prev, isOpen: false }));
+          if (processingState === 'paused' || processingState === 'idle') {
+            runBatchProcessing();
+          }
+        }}
+        onPauseBatch={() => {
+          setQuotaModalState((prev) => ({ ...prev, isOpen: false }));
+          handlePause();
+        }}
       />
 
       {/* 9. 100% Completion Notification Modal with Endless Looping Alarm */}

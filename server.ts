@@ -157,9 +157,6 @@ app.get('/api/quota-stats', (req, res) => {
   });
 });
 
-// Healthy fallback models in order of priority when a model hits 429 quota exhaustion
-const ROBUST_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
-
 // Single Scene Prompt Generator Endpoint
 app.post('/api/generate-prompt', async (req, res) => {
   try {
@@ -193,51 +190,17 @@ ${srtText}
 
 Hãy tạo Prompt ảnh hoàn chỉnh cho phân cảnh này:`;
 
-    // Candidate models to try: first the requested model, then healthy fallback alternatives
-    const candidateModels = [requestedModel];
-    for (const fb of ROBUST_FALLBACK_MODELS) {
-      if (!candidateModels.includes(fb)) {
-        candidateModels.push(fb);
-      }
-    }
+    // Strictly call ONLY requestedModel — NO AUTO-FALLBACK
+    const response = await ai.models.generateContent({
+      model: requestedModel,
+      contents: userPrompt,
+      config: {
+        systemInstruction,
+        temperature: 0.7,
+      },
+    });
 
-    let lastError: any = null;
-    let successfulModel = requestedModel;
-    let generatedPrompt = '';
-
-    for (const candidate of candidateModels) {
-      try {
-        const response = await ai.models.generateContent({
-          model: candidate,
-          contents: userPrompt,
-          config: {
-            systemInstruction,
-            temperature: 0.7,
-          },
-        });
-
-        successfulModel = candidate;
-        generatedPrompt = response.text ? response.text.trim() : '';
-        // If success, break candidate loop
-        lastError = null;
-        break;
-      } catch (err: any) {
-        lastError = err;
-        const msg = err.message || '';
-        // If rate limited or quota exhausted on this candidate, try next healthy model
-        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('503')) {
-          console.warn(`Model ${candidate} hit rate limit / quota, attempting next candidate fallback...`);
-          continue;
-        } else {
-          // If other fatal error (e.g. invalid key), rethrow
-          throw err;
-        }
-      }
-    }
-
-    if (lastError && !generatedPrompt) {
-      throw lastError;
-    }
+    const generatedPrompt = response.text ? response.text.trim() : '';
 
     // Real API call succeeded: record real API call telemetry
     recordRealApiCall(1);
@@ -246,18 +209,34 @@ Hãy tạo Prompt ảnh hoàn chỉnh cho phân cảnh này:`;
       success: true,
       sceneIndex,
       prompt: generatedPrompt,
-      modelUsed: successfulModel,
-      wasFallback: successfulModel !== requestedModel,
-      fallbackNotice: successfulModel !== requestedModel ? `Tự động chuyển đổi sang ${successfulModel} do ${requestedModel} tạm chạm hạn mức.` : undefined,
-      quotaStats: getQuotaSnapshot(successfulModel),
+      modelUsed: requestedModel,
+      wasFallback: false,
+      quotaStats: getQuotaSnapshot(requestedModel),
     });
   } catch (err: any) {
     console.error('Error in /api/generate-prompt:', err);
     
-    // Categorize error for free tier
+    // Categorize error for free tier and calculate intelligent retry duration
     let errorCode = 'UNKNOWN';
     let statusCode = 500;
     let message = err.message || 'Lỗi không xác định';
+
+    let retryAfterSeconds = 60;
+    let isDailyQuota = false;
+
+    const reqModel = req.body.model || 'gemini-3.8-flash';
+    const snapshot = getQuotaSnapshot(reqModel);
+    if (snapshot.requestsToday >= snapshot.maxRPD) {
+      isDailyQuota = true;
+      retryAfterSeconds = snapshot.estimatedResetSeconds;
+    } else {
+      const oldestCall = recentCallTimestamps.length > 0 ? recentCallTimestamps[0] : null;
+      if (oldestCall) {
+        retryAfterSeconds = Math.max(5, Math.ceil((oldestCall + 60000 - Date.now()) / 1000));
+      } else {
+        retryAfterSeconds = 60;
+      }
+    }
 
     if (err.message === 'GEMINI_API_KEY_MISSING' || message.includes('API key')) {
       errorCode = 'API_KEY_INVALID';
@@ -266,17 +245,22 @@ Hãy tạo Prompt ảnh hoàn chỉnh cho phân cảnh này:`;
     } else if (message.includes('429') || message.includes('RESOURCE_EXHAUSTED') || message.includes('quota')) {
       errorCode = 'API_429_RATE_LIMIT';
       statusCode = 429;
-      message = 'Hạn mức API Free Tier bị vượt quá (Rate Limit 429). Đang chờ để tự động thử lại.';
+      message = `Hạn mức API (${reqModel}) tạm thời bị chạm (429 Rate Limit).`;
     } else if (message.includes('503') || message.includes('UNAVAILABLE') || message.includes('overloaded')) {
       errorCode = 'API_503_OVERLOAD';
       statusCode = 503;
       message = 'Máy chủ Google API đang bị quá tải (503 Service Unavailable).';
+      retryAfterSeconds = 15;
     }
 
     return res.status(statusCode).json({
       success: false,
       errorCode,
       error: message,
+      retryAfterSeconds,
+      isDailyQuota,
+      modelUsed: reqModel,
+      quotaStats: snapshot,
       details: err.stack || err.toString(),
     });
   }
@@ -320,59 +304,29 @@ ${JSON.stringify(scenesPayload, null, 2)}
 
 Hãy sinh Prompt ảnh cho tất cả ${scenes.length} phân cảnh trên theo đúng cấu trúc JSON yêu cầu.`;
 
-    const candidateModels = [requestedModel];
-    for (const fb of ROBUST_FALLBACK_MODELS) {
-      if (!candidateModels.includes(fb)) {
-        candidateModels.push(fb);
-      }
-    }
-
-    let lastError: any = null;
-    let successfulModel = requestedModel;
-    let parsedPrompts: Array<{ sceneIndex: number; prompt: string }> = [];
-
-    for (const candidate of candidateModels) {
-      try {
-        const response = await ai.models.generateContent({
-          model: candidate,
-          contents: userPrompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  sceneIndex: { type: Type.INTEGER },
-                  prompt: { type: Type.STRING },
-                },
-                required: ['sceneIndex', 'prompt'],
-              },
+    // Strictly call ONLY requestedModel — NO AUTO-FALLBACK
+    const response = await ai.models.generateContent({
+      model: requestedModel,
+      contents: userPrompt,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              sceneIndex: { type: Type.INTEGER },
+              prompt: { type: Type.STRING },
             },
+            required: ['sceneIndex', 'prompt'],
           },
-        });
+        },
+      },
+    });
 
-        successfulModel = candidate;
-        const jsonText = response.text ? response.text.trim() : '[]';
-        parsedPrompts = JSON.parse(jsonText);
-        lastError = null;
-        break;
-      } catch (err: any) {
-        lastError = err;
-        const msg = err.message || '';
-        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota') || msg.includes('503')) {
-          console.warn(`Batch model ${candidate} hit rate limit / quota, attempting next candidate fallback...`);
-          continue;
-        } else {
-          throw err;
-        }
-      }
-    }
-
-    if (lastError && parsedPrompts.length === 0) {
-      throw lastError;
-    }
+    const jsonText = response.text ? response.text.trim() : '[]';
+    const parsedPrompts = JSON.parse(jsonText);
 
     // Real API call succeeded: record real API call telemetry
     recordRealApiCall(1);
@@ -380,15 +334,32 @@ Hãy sinh Prompt ảnh cho tất cả ${scenes.length} phân cảnh trên theo �
     return res.json({
       success: true,
       prompts: parsedPrompts,
-      modelUsed: successfulModel,
-      wasFallback: successfulModel !== requestedModel,
-      quotaStats: getQuotaSnapshot(successfulModel),
+      modelUsed: requestedModel,
+      wasFallback: false,
+      quotaStats: getQuotaSnapshot(requestedModel),
     });
   } catch (err: any) {
     console.error('Error in /api/generate-prompts-batch:', err);
     let errorCode = 'UNKNOWN';
     let statusCode = 500;
     let message = err.message || 'Lỗi server';
+
+    let retryAfterSeconds = 60;
+    let isDailyQuota = false;
+
+    const reqModel = req.body.model || 'gemini-3.8-flash';
+    const snapshot = getQuotaSnapshot(reqModel);
+    if (snapshot.requestsToday >= snapshot.maxRPD) {
+      isDailyQuota = true;
+      retryAfterSeconds = snapshot.estimatedResetSeconds;
+    } else {
+      const oldestCall = recentCallTimestamps.length > 0 ? recentCallTimestamps[0] : null;
+      if (oldestCall) {
+        retryAfterSeconds = Math.max(5, Math.ceil((oldestCall + 60000 - Date.now()) / 1000));
+      } else {
+        retryAfterSeconds = 60;
+      }
+    }
 
     if (err.message === 'GEMINI_API_KEY_MISSING' || message.includes('API key')) {
       errorCode = 'API_KEY_INVALID';
@@ -397,17 +368,22 @@ Hãy sinh Prompt ảnh cho tất cả ${scenes.length} phân cảnh trên theo �
     } else if (message.includes('429') || message.includes('RESOURCE_EXHAUSTED') || message.includes('quota')) {
       errorCode = 'API_429_RATE_LIMIT';
       statusCode = 429;
-      message = 'Hạn mức Google API Free Tier tạm thời hết (429 Rate Limit).';
+      message = `Hạn mức Google API Free Tier tạm thời bị chạm (429 Rate Limit) cho ${reqModel}.`;
     } else if (message.includes('503') || message.includes('UNAVAILABLE')) {
       errorCode = 'API_503_OVERLOAD';
       statusCode = 503;
       message = 'Dịch vụ Google API đang quá tải (503).';
+      retryAfterSeconds = 15;
     }
 
     return res.status(statusCode).json({
       success: false,
       errorCode,
       error: message,
+      retryAfterSeconds,
+      isDailyQuota,
+      modelUsed: reqModel,
+      quotaStats: snapshot,
       details: err.toString(),
     });
   }
